@@ -45,6 +45,7 @@ class GenerateDatabaseDocs extends Command
     public function handle()
     {
         $database = config('database.connections.mysql.database');
+        $this->info("Generating documentation for database: {$database}");
 
         $columns = DB::table('INFORMATION_SCHEMA.COLUMNS')
             ->select(
@@ -61,11 +62,20 @@ class GenerateDatabaseDocs extends Command
             ->orderBy('ORDINAL_POSITION')
             ->get();
 
+        if ($columns->isEmpty()) {
+            $this->error("No tables found in database {$database}.");
+            return 1;
+        }
+
+        $this->info("Found " . $columns->count() . " columns in total.");
+
         $tables = [];
 
         foreach ($columns as $column) {
             $tables[$column->table][] = $column;
         }
+
+        $this->info("Organizing " . count($tables) . " tables...");
 
         uksort($tables, function ($a, $b) {
             $aIsLaravel = in_array($a, $this->laravelTables);
@@ -80,7 +90,11 @@ class GenerateDatabaseDocs extends Command
         $markdown .= "(retrieved or mocked) to give context for the structure of the data.\n";
         $markdown .= "\n";
 
+        $tableCount = 0;
         foreach ($tables as $tableName => $tableColumns) {
+            $tableCount++;
+            $this->info("Processing table {$tableCount} of " . count($tables) . ": {$tableName}");
+            
             $isLaravelTable = in_array($tableName, $this->laravelTables);
             $laravelTag = $isLaravelTable ? " *(Laravel Default)*" : "";
 
@@ -88,48 +102,72 @@ class GenerateDatabaseDocs extends Command
 
             $modelClass = $this->findModelForTable($tableName);
             if ($modelClass) {
-                $model = new $modelClass();
-                $markdown .= "**Associated Model:** `{$modelClass}`\n\n";
+                try {
+                    $model = new $modelClass();
+                    $markdown .= "**Associated Model:** `{$modelClass}`\n\n";
 
-                $reflection = new ReflectionClass($model);
-                $props = ['fillable', 'casts', 'hidden'];
-                foreach ($props as $prop) {
-                    if ($reflection->hasProperty($prop)) {
-                        $reflectionProperty = $reflection->getProperty($prop);
-                        $reflectionProperty->setAccessible(true);
-                        $value = $reflectionProperty->getValue($model);
-                        if (!empty($value)) {
-                            $markdown .= "**" . ucfirst($prop) . ":** `" . str_replace('`', '\`', json_encode($value)) . "`\n\n";
+                    $reflection = new ReflectionClass($model);
+                    $props = ['fillable', 'casts', 'hidden'];
+                    foreach ($props as $prop) {
+                        if ($reflection->hasProperty($prop)) {
+                            $reflectionProperty = $reflection->getProperty($prop);
+                            $reflectionProperty->setAccessible(true);
+                            $value = $reflectionProperty->getValue($model);
+                            if (!empty($value)) {
+                                $markdown .= "**" . ucfirst($prop) . ":** `" . str_replace('`', '\`', json_encode($value)) . "`\n\n";
+                            }
                         }
                     }
-                }
 
-                $markdown .= "**Relations:**\n";
-                foreach (get_class_methods($model) as $method) {
-                    try {
-                        $result = $model->$method();
-                        if ($result instanceof \Illuminate\Database\Eloquent\Relations\Relation) {
-                            $related = get_class($result->getRelated());
-                            $markdown .= "- `{$method}()` → `" . class_basename($result) . "(`{$related}`)`\n";
+                    $markdown .= "**Relations:**\n";
+                    $hasRelations = false;
+                    foreach (get_class_methods($model) as $method) {
+                        if (in_array($method, ['getRelations', 'getRelation']) || strpos($method, '__') === 0) {
+                            continue; 
                         }
-                    } catch (\Throwable $e) {
-                        // skip
+                        
+                        try {
+                            $reflection = new ReflectionMethod($model, $method);
+                            if ($reflection->getNumberOfParameters() > 0 || $reflection->isStatic()) {
+                                continue;
+                            }
+                            
+                            $result = $model->$method();
+                            if ($result instanceof \Illuminate\Database\Eloquent\Relations\Relation) {
+                                $related = get_class($result->getRelated());
+                                $markdown .= "- `{$method}()` → `" . class_basename($result) . "(`{$related}`)`\n";
+                                $hasRelations = true;
+                            }
+                        } catch (\Throwable $e) {
+                            // skip
+                        }
                     }
+                    
+                    if (!$hasRelations) {
+                        $markdown .= "- No relations found\n";
+                    }
+                    $markdown .= "\n";
+                } catch (\Throwable $e) {
+                    $this->warn("Error processing model for table {$tableName}: " . $e->getMessage());
                 }
-                $markdown .= "\n";
             }
 
             $markdown .= "| Column | Type | Nullable | Key | Default | Extra |\n";
             $markdown .= "|--------|------|----------|-----|---------|-------|\n";
 
             foreach ($tableColumns as $col) {
-                $markdown .= "| `{$col->column}` | `{$col->type}` | `{$col->nullable}` | `{$col->key}` | `" .
-                    ($col->default_value ?? 'NULL') . "` | `{$col->extra}` |\n";
+                $default = $col->default_value !== null ? $col->default_value : 'NULL';
+                $markdown .= "| `{$col->column}` | `{$col->type}` | `{$col->nullable}` | `{$col->key}` | `{$default}` | `{$col->extra}` |\n";
             }
 
             $markdown .= "\n### Example JSON:\n\n";
 
-            $example = DB::table($tableName)->first();
+            try {
+                $example = DB::table($tableName)->first();
+            } catch (\Exception $e) {
+                $this->warn("Error fetching example for table {$tableName}: " . $e->getMessage());
+                $example = null;
+            }
 
             if (!$example) {
                 $example = [];
@@ -138,16 +176,45 @@ class GenerateDatabaseDocs extends Command
                 }
             } else {
                 $example = (array) $example;
+                // Ensure binary or complex values are properly formatted
+                foreach ($example as $key => $value) {
+                    if (is_resource($value) || $value instanceof \stdClass) {
+                        $example[$key] = '[Complex Data]';
+                    }
+                }
             }
 
-            $markdown .= "```json\n";
-            $markdown .= json_encode($example, JSON_PRETTY_PRINT);
-            $markdown .= "\n```\n\n";
+            try {
+                $jsonString = json_encode($example, JSON_PRETTY_PRINT);
+                if ($jsonString === false) {
+                    $this->warn("Error encoding JSON for table {$tableName}: " . json_last_error_msg());
+                    // Replace with simplified values in case of failure
+                    $example = array_map(function ($value) {
+                        return is_scalar($value) ? $value : '[Complex Data]';
+                    }, $example);
+                    $jsonString = json_encode($example, JSON_PRETTY_PRINT);
+                }
+                $markdown .= "```json\n";
+                $markdown .= $jsonString;
+                $markdown .= "\n```\n\n";
+            } catch (\Throwable $e) {
+                $this->warn("Error processing JSON for table {$tableName}: " . $e->getMessage());
+                $markdown .= "```json\n{\"error\": \"Data too complex to display\"}\n```\n\n";
+            }
         }
 
-        File::put(base_path("db-documentation-{$database}.md"), $markdown);
-
-        $this->info("Documentation generated: db-documentation-{$database}.md");
+        $this->info("Documentation generated. Saving file...");
+        $outputPath = base_path("db-documentation-{$database}.md");
+        
+        try {
+            File::put($outputPath, $markdown);
+            $this->info("Documentation successfully saved to: {$outputPath}");
+            $this->info("File size: " . number_format(strlen($markdown)) . " bytes");
+            return 0;
+        } catch (\Exception $e) {
+            $this->error("Error saving documentation: " . $e->getMessage());
+            return 1;
+        }
     }
 
     private function mockValue($type)
