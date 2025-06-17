@@ -55,7 +55,8 @@ class GenerateDatabaseDocs extends Command
                 'IS_NULLABLE as nullable',
                 'COLUMN_KEY as key',
                 'COLUMN_DEFAULT as default_value',
-                'EXTRA as extra'
+                'EXTRA as extra',
+                'COLUMN_COMMENT as column_comment',
             )
             ->where('TABLE_SCHEMA', $database)
             ->orderBy('TABLE_NAME')
@@ -152,12 +153,13 @@ class GenerateDatabaseDocs extends Command
                 }
             }
 
-            $markdown .= "| Column | Type | Nullable | Key | Default | Extra |\n";
-            $markdown .= "|--------|------|----------|-----|---------|-------|\n";
+            $markdown .= "| Column | Type | Nullable | Key | Default | Extra | Comment |\n";
+            $markdown .= "|--------|------|----------|-----|---------|-------|---------|\n";
 
             foreach ($tableColumns as $col) {
-                $default = $col->default_value !== null ? $col->default_value : 'NULL';
-                $markdown .= "| `{$col->column}` | `{$col->type}` | `{$col->nullable}` | `{$col->key}` | `{$default}` | `{$col->extra}` |\n";
+                $default = $col->default_value ?? 'NULL';
+                $comment = $col->column_comment ?? '';
+                $markdown .= "| `{$col->column}` | `{$col->type}` | `{$col->nullable}` | `{$col->key}` | `{$default}` | `{$col->extra}` | `{$comment}` |\n";
             }
 
             $markdown .= "\n### Example JSON:\n\n";
